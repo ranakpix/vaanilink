@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import Image from 'next/image';
 import { ArrowUpRight } from 'lucide-react';
 import ThemeToggle from './ThemeToggle';
 
@@ -7,8 +8,15 @@ export default function Header() {
     <header className="sticky top-0 z-40 border-b border-border bg-card/70 backdrop-blur-xl">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4">
         <div className="flex items-center gap-3">
-          <div className="grid h-9 w-9 place-items-center rounded-xl border border-border bg-white/70 text-primary shadow-sm">
-            <span className="text-sm font-black">∞</span>
+          <div className="relative h-10 w-10 overflow-hidden rounded-xl border border-border bg-white/70 shadow-sm">
+            <Image
+              src="/vaanilink-logo.png"
+              alt="VaaniLink sign-to-speech AI logo"
+              fill
+              sizes="40px"
+              className="object-contain"
+              priority
+            />
           </div>
           <span className="text-lg font-bold tracking-tight text-foreground">VaaniLink</span>
         </div>

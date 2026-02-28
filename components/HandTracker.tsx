@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 import { Camera, CircleStop, Volume2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { toast } from 'sonner';
 
 type Landmark = { x: number; y: number; z?: number };
 type Landmarks = Landmark[];
@@ -48,7 +49,10 @@ type GestureId =
   | 'assistance'
   | 'thank_you'
   | 'please'
-  | 'goodbye';
+  | 'goodbye'
+  | 'water'
+  | 'restroom'
+  | 'stop';
 
 const GESTURE_PHRASE: Record<GestureId, string> = {
   hello: 'Hello',
@@ -61,6 +65,9 @@ const GESTURE_PHRASE: Record<GestureId, string> = {
   thank_you: 'Thank you',
   please: 'Please',
   goodbye: 'Goodbye',
+  water: 'I need water',
+  restroom: 'I need the restroom',
+  stop: 'Please stop',
 };
 
 function dist2(a: Landmark, b: Landmark) {
@@ -73,7 +80,15 @@ function dist(a: Landmark, b: Landmark) {
   return Math.sqrt(dist2(a, b));
 }
 
-function isFingerExtended(landmarks: Landmarks, mcp: number, pip: number, tip: number) {
+function getHandSize(landmarks: Landmarks) {
+  // Dynamic scale reference: wrist -> middle MCP distance
+  const wrist = landmarks[0];
+  const middleMcp = landmarks[9];
+  if (!wrist || !middleMcp) return 0;
+  return dist(wrist, middleMcp);
+}
+
+function isFingerExtended(landmarks: Landmarks, mcp: number, pip: number, tip: number, handSize: number) {
   const wrist = landmarks[0];
   const m = landmarks[mcp];
   const p = landmarks[pip];
@@ -82,33 +97,39 @@ function isFingerExtended(landmarks: Landmarks, mcp: number, pip: number, tip: n
 
   // Finger is extended when the tip is significantly farther from the wrist than the PIP.
   // This is more rotation-tolerant than relying on y-only comparisons.
-  return dist2(t, wrist) > dist2(p, wrist) + 0.01 && dist2(p, wrist) > dist2(m, wrist) + 0.005;
+  const hs2 = Math.max(handSize, 0.0001) ** 2;
+  return dist2(t, wrist) > dist2(p, wrist) + 0.16 * hs2 && dist2(p, wrist) > dist2(m, wrist) + 0.08 * hs2;
 }
 
-function isFingerCurled(landmarks: Landmarks, mcp: number, pip: number, tip: number) {
+function isFingerCurled(landmarks: Landmarks, mcp: number, pip: number, tip: number, handSize: number) {
   const wrist = landmarks[0];
   const m = landmarks[mcp];
   const p = landmarks[pip];
   const t = landmarks[tip];
   if (!wrist || !m || !p || !t) return false;
-  return dist2(t, wrist) + 0.008 < dist2(p, wrist);
+  const hs2 = Math.max(handSize, 0.0001) ** 2;
+  return dist2(t, wrist) + 0.128 * hs2 < dist2(p, wrist);
 }
 
-function isThumbExtended(landmarks: Landmarks) {
+function isThumbExtended(landmarks: Landmarks, handSize: number) {
   const wrist = landmarks[0];
   const tip = landmarks[4];
   const ip = landmarks[3];
   const mcp = landmarks[2];
   if (!wrist || !tip || !ip || !mcp) return false;
-  return dist2(tip, wrist) > dist2(ip, wrist) + 0.008 && dist2(ip, wrist) > dist2(mcp, wrist) + 0.004;
+  const hs2 = Math.max(handSize, 0.0001) ** 2;
+  return dist2(tip, wrist) > dist2(ip, wrist) + 0.128 * hs2 && dist2(ip, wrist) > dist2(mcp, wrist) + 0.064 * hs2;
 }
 
 type HandTrackerProps = {
   autoStart?: boolean;
   onPhrase?: (phrase: string, gestureId: GestureId) => void;
+  voiceId?: string;
+  modelId?: string;
 };
 
-const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
+const LOCK_FRAMES = 10;
+const HandTracker = ({ autoStart = true, onPhrase, voiceId, modelId }: HandTrackerProps) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [handLandmarker, setHandLandmarker] = useState<HandLandmarker | null>(null);
@@ -123,11 +144,26 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
   const lastSpokenTime = useRef<number>(0);
   const streamRef = useRef<MediaStream | null>(null);
   const elevenLabsDisabledRef = useRef(false);
-  const recentGesturesRef = useRef<GestureId[]>([]);
   const lastSpokenGestureRef = useRef<GestureId | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [lockedGesture, setLockedGesture] = useState<GestureId | null>(null);
+  const lockedGestureRef = useRef<GestureId | null>(null);
+  const lockUiTimeoutRef = useRef<number | null>(null);
+  const lockStateRef = useRef<{ candidate: GestureId | null; streak: number }>({ candidate: null, streak: 0 });
   const waveRef = useRef<{ lastX: number | null; lastDir: -1 | 0 | 1; flips: number; startMs: number; minX: number; maxX: number }>({ lastX: null, lastDir: 0, flips: 0, startMs: 0, minX: 1, maxX: 0 });
   const stillRef = useRef<{ lastX: number | null; lastY: number | null; stillMs: number; lastMs: number }>({ lastX: null, lastY: null, stillMs: 0, lastMs: 0 });
   const startRequestedRef = useRef(autoStart);
+  const [isCalibrating, setIsCalibrating] = useState(false);
+  const [calibrationCountdown, setCalibrationCountdown] = useState<number>(0);
+  const calibrationRef = useRef<{
+    baselineHandSize: number;
+    brightness: number;
+    isReady: boolean;
+    startedAt: number;
+    samples: number;
+    sumHandSize: number;
+    sumBrightness: number;
+  }>({ baselineHandSize: 0, brightness: 0, isReady: false, startedAt: 0, samples: 0, sumHandSize: 0, sumBrightness: 0 });
 
   const speakViaBrowser = useCallback((text: string) => {
     if (!('speechSynthesis' in window)) return;
@@ -152,7 +188,7 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
             delegate: "GPU"
           },
           runningMode: "VIDEO",
-          numHands: 1
+          numHands: 2
         });
         setHandLandmarker(landmarker);
         setIsModelReady(true);
@@ -181,15 +217,22 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
       const response = await fetch('/api/speak', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, voiceId, modelId }),
       });
 
       if (response.ok) {
+        // Stream as it downloads (browser will start playing as enough data is buffered).
         const audioBlob = await response.blob();
         const audioUrl = URL.createObjectURL(audioBlob);
-        const audio = new Audio(audioUrl);
+        if (!audioRef.current) audioRef.current = new Audio();
+        const audio = audioRef.current;
+        audio.src = audioUrl;
         audio.onended = () => URL.revokeObjectURL(audioUrl);
-        await audio.play();
+        await audio.play().catch(() => {
+          // If autoplay policy blocks, fall back to device voice.
+          URL.revokeObjectURL(audioUrl);
+          speakViaBrowser(text);
+        });
         return;
       }
 
@@ -206,6 +249,7 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
 
       console.warn('ElevenLabs TTS failed:', response.status, errorText);
       setDetectedText('TTS fallback (device voice)');
+      toast.warning('Voice engine offline. Using device voice.', { description: errorText });
       if (response.status === 401 || response.status === 403) {
         elevenLabsDisabledRef.current = true;
       }
@@ -213,11 +257,12 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
     } catch (error) {
       console.error("Voice Error:", error);
       setDetectedText('TTS fallback (device voice)');
+      toast.warning('Voice engine offline. Using device voice.');
       speakViaBrowser(text);
     } finally {
       setTimeout(() => setIsSpeaking(false), 2000);
     }
-  }, [speakViaBrowser]);
+  }, [modelId, speakViaBrowser, voiceId]);
 
   const classifyGesture = useCallback((landmarks: Landmarks): GestureId | null => {
     const wrist = landmarks[0];
@@ -226,22 +271,26 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
     const indexMcp = landmarks[5];
     if (!wrist || !thumbTip || !thumbMcp) return null;
 
-    const thumb = isThumbExtended(landmarks);
-    const index = isFingerExtended(landmarks, 5, 6, 8);
-    const middle = isFingerExtended(landmarks, 9, 10, 12);
-    const ring = isFingerExtended(landmarks, 13, 14, 16);
-    const pinky = isFingerExtended(landmarks, 17, 18, 20);
+    const handSize = getHandSize(landmarks);
+    const hs = Math.max(handSize, calibrationRef.current.baselineHandSize || 0, 0.0001);
 
-    const indexCurled = isFingerCurled(landmarks, 5, 6, 8);
-    const middleCurled = isFingerCurled(landmarks, 9, 10, 12);
-    const ringCurled = isFingerCurled(landmarks, 13, 14, 16);
-    const pinkyCurled = isFingerCurled(landmarks, 17, 18, 20);
+    const thumb = isThumbExtended(landmarks, hs);
+    const index = isFingerExtended(landmarks, 5, 6, 8, hs);
+    const middle = isFingerExtended(landmarks, 9, 10, 12, hs);
+    const ring = isFingerExtended(landmarks, 13, 14, 16, hs);
+    const pinky = isFingerExtended(landmarks, 17, 18, 20, hs);
 
-    const thumbSpreadOk = indexMcp ? dist(thumbTip, indexMcp) > 0.12 : true;
+    const indexCurled = isFingerCurled(landmarks, 5, 6, 8, hs);
+    const middleCurled = isFingerCurled(landmarks, 9, 10, 12, hs);
+    const ringCurled = isFingerCurled(landmarks, 13, 14, 16, hs);
+    const pinkyCurled = isFingerCurled(landmarks, 17, 18, 20, hs);
+
+    const thumbSpreadOk = indexMcp ? dist(thumbTip, indexMcp) > 0.48 * hs : true;
     const palmFour = index && middle && ring && pinky;
     const openHand = thumbSpreadOk && thumb && palmFour; // ✋ hello base
     const fist = indexCurled && middleCurled && ringCurled && pinkyCurled && !index && !middle && !ring && !pinky; // 👊 yes (robust)
     const fourFingers = !thumb && palmFour; // 🤚 thank you
+    const waterShape = !thumb && index && middle && ring && !pinky; // "W" shape -> water
 
     // Wave detection for Goodbye: open hand + horizontal oscillation of wrist.
     // Track direction flips in ~1.5s window.
@@ -252,7 +301,8 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
       const s = waveRef.current;
       const lastX = s.lastX;
       const dx = lastX == null ? 0 : wrist.x - lastX;
-      const dir: -1 | 0 | 1 = dx > 0.03 ? 1 : dx < -0.03 ? -1 : 0;
+      const dirThreshold = 0.12 * hs;
+      const dir: -1 | 0 | 1 = dx > dirThreshold ? 1 : dx < -dirThreshold ? -1 : 0;
 
       if (s.startMs === 0) s.startMs = now;
       if (dir !== 0 && s.lastDir !== 0 && dir !== s.lastDir) s.flips += 1;
@@ -272,7 +322,7 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
       const amplitude = s.maxX - s.minX;
       // Require a clearer wave: enough side-to-side distance + multiple direction flips,
       // and not just jitter for a few frames.
-      if (now - s.startMs > 450 && s.flips >= 3 && amplitude > 0.14) {
+      if (now - s.startMs > 450 && s.flips >= 3 && amplitude > 0.56 * hs) {
         s.startMs = now;
         s.flips = 0;
         s.lastDir = 0;
@@ -285,8 +335,8 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
       waveRef.current = { lastX: null, lastDir: 0, flips: 0, startMs: 0, minX: 1, maxX: 0 };
     }
 
-    // "Please" approximation: open hand held still near center-lower region.
-    // (We don't have body pose, so this approximates "hand on chest" as a stable held palm.)
+    // "Please" and "Stop" approximation: open hand held still.
+    // (We don't have body pose, so we approximate zones in the frame.)
     if (openHand || fourFingers) {
       const now = performance.now();
       const st = stillRef.current;
@@ -300,8 +350,14 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
       st.lastY = wrist.y;
       st.lastMs = now;
 
-      // Approximate "hand on chest": stable palm held in the lower-middle of the frame.
-      // Also allow it anywhere if the user holds the open palm still for long enough.
+      // Upper-middle stable palm -> "stop"
+      const inStopZone = wrist.x > 0.25 && wrist.x < 0.75 && wrist.y < 0.45;
+      if (inStopZone && st.stillMs > 650) {
+        st.stillMs = 0;
+        return 'stop';
+      }
+
+      // Lower-middle stable palm -> "please"
       const inChestZone = wrist.x > 0.30 && wrist.x < 0.70 && wrist.y > 0.45;
       if ((inChestZone && st.stillMs > 650) || st.stillMs > 1100) {
         st.stillMs = 0;
@@ -310,6 +366,9 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
     } else {
       stillRef.current = { lastX: null, lastY: null, stillMs: 0, lastMs: 0 };
     }
+
+    // Daily-use / emergency gestures.
+    if (waterShape) return 'water'; // "W" hand -> I need water
 
     // Priority gestures (match the image)
     // 🤟 (ILY) -> I need assistance
@@ -320,8 +379,9 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
 
     // 👍 / 👎
     if (thumb && !index && !middle && !ring && !pinky) {
-      const up = thumbTip.y < Math.min(thumbMcp.y, wrist.y) - 0.06;
-      const down = thumbTip.y > Math.max(thumbMcp.y, wrist.y) + 0.06;
+      const yThresh = 0.24 * hs;
+      const up = thumbTip.y < Math.min(thumbMcp.y, wrist.y) - yThresh;
+      const down = thumbTip.y > Math.max(thumbMcp.y, wrist.y) + yThresh;
       if (down) return 'no';
       if (up) return 'good_okay';
       return 'good_okay';
@@ -335,7 +395,7 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
     return null;
   }, []);
 
-  const drawCanvas = useCallback((landmarks: Landmarks) => {
+  const drawCanvas = useCallback((landmarks: Landmarks, isLocked: boolean) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -345,7 +405,7 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
     ctx.clearRect(0, 0, width, height);
 
     // Draw connections (skeleton)
-    ctx.strokeStyle = "#3b82f6"; // blue lines
+    ctx.strokeStyle = isLocked ? "#22c55e" : "#3b82f6"; // green when locked, else blue
     ctx.lineWidth = 3;
     for (const [start, end] of HAND_CONNECTIONS) {
       const a = landmarks[start];
@@ -358,7 +418,7 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
     }
 
     // Draw joints
-    ctx.fillStyle = "#22c55e"; // green points
+    ctx.fillStyle = isLocked ? "#22c55e" : "#60a5fa";
     for (const pt of landmarks) {
       ctx.beginPath();
       ctx.arc(pt.x * width, pt.y * height, 4, 0, 2 * Math.PI);
@@ -407,6 +467,11 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
       await video.play();
       setIsCameraActive(true);
 
+      // Start a short calibration window (3s) for dynamic thresholds + ambient brightness.
+      calibrationRef.current = { baselineHandSize: 0, brightness: 0, isReady: false, startedAt: performance.now(), samples: 0, sumHandSize: 0, sumBrightness: 0 };
+      setIsCalibrating(true);
+      setCalibrationCountdown(3);
+
       // After permission is granted, we can list device labels.
       await refreshVideoDevices();
     } catch (e) {
@@ -449,39 +514,114 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
     const predict = () => {
       if (video.readyState >= 2) {
         const results = handLandmarker.detectForVideo(video, performance.now());
-        const landmarks = results.landmarks?.[0] as Landmarks | undefined;
-        if (landmarks && landmarks.length > 0) {
-          const g = classifyGesture(landmarks);
-          if (g) {
-            const recent = recentGesturesRef.current;
-            recent.push(g);
-            if (recent.length > 8) recent.shift();
+        const lm0 = (results.landmarks?.[0] as Landmarks | undefined) ?? undefined;
+        const lm1 = (results.landmarks?.[1] as Landmarks | undefined) ?? undefined;
 
-            // Majority vote for stability
-            const counts = new Map<GestureId, number>();
-            for (const it of recent) counts.set(it, (counts.get(it) ?? 0) + 1);
-            let best: GestureId | null = null;
-            let bestCount = 0;
-            for (const [k, v] of counts.entries()) {
-              if (v > bestCount) {
-                best = k;
-                bestCount = v;
-              }
-            }
+        // Calibration sampling (3 seconds).
+        if (isCalibrating) {
+          const now = performance.now();
+          const elapsed = now - calibrationRef.current.startedAt;
+          const remaining = Math.max(0, 3000 - elapsed);
+          const sec = Math.ceil(remaining / 1000);
+          if (sec !== calibrationCountdown) setCalibrationCountdown(sec);
 
-            if (best && bestCount >= 5) {
-              setDetectedText(GESTURE_PHRASE[best]);
-              const now = Date.now();
-              const cooldownOk = now - lastSpokenTime.current >= 2500;
-              if (cooldownOk && lastSpokenGestureRef.current !== best) {
-                lastSpokenGestureRef.current = best;
-                onPhrase?.(GESTURE_PHRASE[best], best);
-                speak(GESTURE_PHRASE[best]);
+          const canvas = canvasRef.current;
+          const ctx = canvas?.getContext('2d');
+          if (canvas && ctx) {
+            try {
+              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+              const img = ctx.getImageData(0, 0, 64, 48).data; // small sample
+              let sum = 0;
+              for (let i = 0; i < img.length; i += 4) {
+                const r = img[i] ?? 0;
+                const g = img[i + 1] ?? 0;
+                const b = img[i + 2] ?? 0;
+                sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
               }
+              const avg = sum / (img.length / 4) / 255;
+              calibrationRef.current.sumBrightness += avg;
+            } catch {
+              // ignore CORS-ish failures (shouldn't happen for camera)
             }
           }
-          drawCanvas(landmarks);
+
+          const hs0 = lm0 ? getHandSize(lm0) : 0;
+          const hs1 = lm1 ? getHandSize(lm1) : 0;
+          const hs = Math.max(hs0, hs1);
+          if (hs > 0) calibrationRef.current.sumHandSize += hs;
+          calibrationRef.current.samples += 1;
+
+          if (elapsed >= 3000) {
+            const samples = Math.max(1, calibrationRef.current.samples);
+            calibrationRef.current.baselineHandSize = calibrationRef.current.sumHandSize / samples;
+            calibrationRef.current.brightness = calibrationRef.current.sumBrightness / samples;
+            calibrationRef.current.isReady = true;
+            setIsCalibrating(false);
+            setCalibrationCountdown(0);
+            toast.success('Calibration complete');
+          }
         }
+
+        // Gesture detection: take best of both hands, plus simple two-hand interactions.
+        const g0 = lm0 && lm0.length > 0 ? classifyGesture(lm0) : null;
+        const g1 = lm1 && lm1.length > 0 ? classifyGesture(lm1) : null;
+
+        let combined: GestureId | null = null;
+        if (lm0 && lm1 && lm0[0] && lm1[0]) {
+          const hs = Math.max(getHandSize(lm0), getHandSize(lm1), calibrationRef.current.baselineHandSize || 0, 0.0001);
+          const wristsClose = dist(lm0[0], lm1[0]) < 0.55 * hs;
+          const lowHands = lm0[0].y > 0.55 && lm1[0].y > 0.55;
+
+          // Two fists low and close -> restroom
+          if (wristsClose && lowHands && g0 === 'yes' && g1 === 'yes') {
+            combined = 'restroom';
+          } else if (
+            wristsClose &&
+            (g0 === 'hello' || g0 === 'thank_you' || g0 === 'please') &&
+            (g1 === 'hello' || g1 === 'thank_you' || g1 === 'please')
+          ) {
+            // Hands together with open palms -> please (namaste-like)
+            combined = 'please';
+          }
+        }
+
+        const candidate = combined ?? g0 ?? g1;
+        const lock = lockStateRef.current;
+        if (candidate && candidate === lock.candidate) {
+          lock.streak += 1;
+        } else {
+          lock.candidate = candidate;
+          lock.streak = candidate ? 1 : 0;
+        }
+
+        if (candidate) {
+          setDetectedText(GESTURE_PHRASE[candidate]);
+        }
+
+        if (candidate && lock.streak >= LOCK_FRAMES) {
+          const nowMs = Date.now();
+          const cooldownOk = nowMs - lastSpokenTime.current >= 2500;
+          if (cooldownOk && lastSpokenGestureRef.current !== candidate) {
+            lastSpokenGestureRef.current = candidate;
+            lockedGestureRef.current = candidate;
+            setLockedGesture(candidate);
+            if (lockUiTimeoutRef.current) window.clearTimeout(lockUiTimeoutRef.current);
+            lockUiTimeoutRef.current = window.setTimeout(() => setLockedGesture(null), 900);
+
+            try {
+              window.navigator?.vibrate?.(25);
+            } catch {
+              // ignore
+            }
+
+            onPhrase?.(GESTURE_PHRASE[candidate], candidate);
+            speak(GESTURE_PHRASE[candidate]);
+          }
+        }
+
+        // Draw whichever hand we have (prefer first).
+        const drawLm = lm0 && lm0.length > 0 ? lm0 : lm1 && lm1.length > 0 ? lm1 : null;
+        if (drawLm) drawCanvas(drawLm, Boolean(lockedGestureRef.current));
       }
       animationFrameId = requestAnimationFrame(predict);
     };
@@ -491,7 +631,7 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
     return () => {
       if (animationFrameId != null) cancelAnimationFrame(animationFrameId);
     };
-  }, [classifyGesture, drawCanvas, handLandmarker, isCameraActive, onPhrase, speak]);
+  }, [calibrationCountdown, classifyGesture, drawCanvas, handLandmarker, isCalibrating, isCameraActive, onPhrase, speak]);
 
   return (
     <div className="relative w-full max-w-2xl mx-auto bg-slate-900 rounded-3xl overflow-hidden border border-slate-800 shadow-2xl">
@@ -562,6 +702,17 @@ const HandTracker = ({ autoStart = true, onPhrase }: HandTrackerProps) => {
             >
               {isStartingCamera ? 'Starting…' : 'Enable Camera'}
             </button>
+          </div>
+        </div>
+      )}
+
+      {isCameraActive && isCalibrating && (
+        <div className="absolute inset-0 grid place-items-center bg-black/35 p-6">
+          <div className="w-full max-w-sm rounded-2xl border border-white/15 bg-white/10 p-6 text-center text-white backdrop-blur-xl">
+            <p className="text-sm font-semibold">Calibrating…</p>
+            <p className="mt-1 text-xs text-white/80">
+              Hold your hand comfortably in view. Starting in <span className="font-black">{calibrationCountdown}</span>
+            </p>
           </div>
         </div>
       )}

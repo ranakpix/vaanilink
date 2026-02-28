@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server';
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
 
 type SpeakBody = {
   text?: string;
@@ -8,6 +10,28 @@ type SpeakBody = {
 
 const FALLBACK_VOICE_ID = '21m00Tcm4TlvDq8ikWAM'; // Rachel (commonly available built-in voice)
 const DEFAULT_MODEL_ID = 'eleven_turbo_v2_5';
+
+function getClientIp(req: Request) {
+  const xf = req.headers.get('x-forwarded-for');
+  if (xf) return xf.split(',')[0]?.trim() || 'unknown';
+  const xr = req.headers.get('x-real-ip');
+  if (xr) return xr.trim();
+  return 'unknown';
+}
+
+function getRatelimiter() {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+
+  const redis = new Redis({ url, token });
+  return new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(20, '1 m'), // 20 TTS/min/IP
+    analytics: true,
+    prefix: 'vaanilink:rl:speak',
+  });
+}
 
 async function resolveVoiceId(apiKey: string, preferredVoiceId?: string) {
   if (preferredVoiceId) return preferredVoiceId;
@@ -37,6 +61,18 @@ async function resolveVoiceId(apiKey: string, preferredVoiceId?: string) {
 
 export async function POST(req: Request) {
   try {
+    const rl = getRatelimiter();
+    if (rl) {
+      const ip = getClientIp(req);
+      const { success, reset } = await rl.limit(ip);
+      if (!success) {
+        return NextResponse.json(
+          { error: { detail: { message: 'Rate limit exceeded. Please slow down.' }, reset } },
+          { status: 429 }
+        );
+      }
+    }
+
     const body = (await req.json()) as SpeakBody;
     const text = body.text?.trim();
     
@@ -58,7 +94,7 @@ export async function POST(req: Request) {
 
     // 2. Call ElevenLabs API
     const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
       {
         method: 'POST',
         headers: {
@@ -86,8 +122,7 @@ export async function POST(req: Request) {
     }
 
     // 3. Stream the audio back to the frontend
-    const audioBuffer = await response.arrayBuffer();
-    return new NextResponse(audioBuffer, {
+    return new NextResponse(response.body, {
       headers: {
         'Content-Type': 'audio/mpeg',
       },
