@@ -12,12 +12,18 @@ import { toast } from 'sonner';
 type SavedItem = { text: string; createdAt: number };
 type VoiceItem = { voice_id: string; name: string };
 
+const FEATURED_VOICES: VoiceItem[] = [
+  { name: 'Lauren (English - Gentle)', voice_id: 'DODLEQrClDo8wCz460ld' },
+  { name: 'Ranbir (Hindi - Deep)', voice_id: 'nZ5WsS2E2UAALki8m2V6' },
+  { name: 'Viraj (Hindi - Clear)', voice_id: 'FmBhnvP58BK0vz65OOj7' },
+];
+
 export default function TranslatorPage() {
   const [output, setOutput] = useState<string>('{Ready for translation... Enable camera and show sign language}');
   const [lastGesture, setLastGesture] = useState<string>('');
   const [transcript, setTranscript] = useState<Array<{ id: string; text: string; gestureId: string; createdAt: number }>>([]);
-  const [voices, setVoices] = useState<VoiceItem[]>([]);
-  const [selectedVoiceId, setSelectedVoiceId] = useState<string>('');
+  const [voices, setVoices] = useState<VoiceItem[]>(FEATURED_VOICES);
+  const [selectedVoiceId, setSelectedVoiceId] = useState<string>('DODLEQrClDo8wCz460ld');
 
   const onPhrase = useCallback((phrase: string, gestureId: string) => {
     setOutput(phrase);
@@ -56,7 +62,15 @@ export default function TranslatorPage() {
       }
 
       const v = Array.isArray(data.voices) ? data.voices : [];
-      setVoices(v);
+      setVoices((prev) => {
+        const combined = [...prev];
+        v.forEach((newVoice) => {
+          if (!combined.some((cv) => cv.voice_id === newVoice.voice_id)) {
+            combined.push(newVoice);
+          }
+        });
+        return combined;
+      });
       if (!selectedVoiceId && v.length > 0) {
         setSelectedVoiceId(v[0]?.voice_id ?? '');
       }
