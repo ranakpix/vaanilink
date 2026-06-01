@@ -1,0 +1,10 @@
+commit a61a2921c19067a56eba05df0b8650d5b457838c
+Author: sayuj5 <sayuj5@gmail.com>
+Date:   Mon Mar 30 21:13:58 2026 +0530
+
+    feat: Add SOS button and diagrammatic gesture guide
+
+ app/translator/page.tsx     | 16 +++++++----
+ components/GestureGuide.tsx | 68 +++++++++++++++++++++++++++++++++++++++++++++
+ components/SOSButton.tsx    | 53 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 132 insertions(+), 5 deletions(-)

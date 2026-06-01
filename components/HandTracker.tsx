@@ -150,8 +150,14 @@ const HandTracker = ({ autoStart = true, onPhrase, voiceId, modelId }: HandTrack
   const lockedGestureRef = useRef<GestureId | null>(null);
   const lockUiTimeoutRef = useRef<number | null>(null);
   const lockStateRef = useRef<{ candidate: GestureId | null; streak: number }>({ candidate: null, streak: 0 });
-  const waveRef = useRef<{ lastX: number | null; lastDir: -1 | 0 | 1; flips: number; startMs: number; minX: number; maxX: number }>({ lastX: null, lastDir: 0, flips: 0, startMs: 0, minX: 1, maxX: 0 });
-  const stillRef = useRef<{ lastX: number | null; lastY: number | null; stillMs: number; lastMs: number }>({ lastX: null, lastY: null, stillMs: 0, lastMs: 0 });
+  const waveRef = useRef<{ lastX: number | null; lastDir: -1 | 0 | 1; flips: number; startMs: number; minX: number; maxX: number }[]>([
+    { lastX: null, lastDir: 0, flips: 0, startMs: 0, minX: 1, maxX: 0 },
+    { lastX: null, lastDir: 0, flips: 0, startMs: 0, minX: 1, maxX: 0 }
+  ]);
+  const stillRef = useRef<{ lastX: number | null; lastY: number | null; stillMs: number; lastMs: number }[]>([
+    { lastX: null, lastY: null, stillMs: 0, lastMs: 0 },
+    { lastX: null, lastY: null, stillMs: 0, lastMs: 0 }
+  ]);
   const startRequestedRef = useRef(autoStart);
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [calibrationCountdown, setCalibrationCountdown] = useState<number>(0);
@@ -264,7 +270,7 @@ const HandTracker = ({ autoStart = true, onPhrase, voiceId, modelId }: HandTrack
     }
   }, [modelId, speakViaBrowser, voiceId]);
 
-  const classifyGesture = useCallback((landmarks: Landmarks): GestureId | null => {
+  const classifyGesture = useCallback((landmarks: Landmarks, handIndex: number): GestureId | null => {
     const wrist = landmarks[0];
     const thumbTip = landmarks[4];
     const thumbMcp = landmarks[2];
@@ -298,7 +304,7 @@ const HandTracker = ({ autoStart = true, onPhrase, voiceId, modelId }: HandTrack
     // whenever the 4 fingers are extended.
     if (palmFour) {
       const now = performance.now();
-      const s = waveRef.current;
+      const s = waveRef.current[handIndex];
       const lastX = s.lastX;
       const dx = lastX == null ? 0 : wrist.x - lastX;
       const dirThreshold = 0.12 * hs;
@@ -332,14 +338,14 @@ const HandTracker = ({ autoStart = true, onPhrase, voiceId, modelId }: HandTrack
       }
     } else {
       // reset wave state when not open
-      waveRef.current = { lastX: null, lastDir: 0, flips: 0, startMs: 0, minX: 1, maxX: 0 };
+      waveRef.current[handIndex] = { lastX: null, lastDir: 0, flips: 0, startMs: 0, minX: 1, maxX: 0 };
     }
 
     // "Please" and "Stop" approximation: open hand held still.
     // (We don't have body pose, so we approximate zones in the frame.)
     if (openHand || fourFingers) {
       const now = performance.now();
-      const st = stillRef.current;
+      const st = stillRef.current[handIndex];
       const lastMs = st.lastMs || now;
       const dt = now - lastMs;
       const dx = st.lastX == null ? 0 : Math.abs(wrist.x - st.lastX);
@@ -364,7 +370,7 @@ const HandTracker = ({ autoStart = true, onPhrase, voiceId, modelId }: HandTrack
         return 'please';
       }
     } else {
-      stillRef.current = { lastX: null, lastY: null, stillMs: 0, lastMs: 0 };
+      stillRef.current[handIndex] = { lastX: null, lastY: null, stillMs: 0, lastMs: 0 };
     }
 
     // Daily-use / emergency gestures.
@@ -571,8 +577,8 @@ const HandTracker = ({ autoStart = true, onPhrase, voiceId, modelId }: HandTrack
         }
 
         // Gesture detection: take best of both hands, plus simple two-hand interactions.
-        const g0 = lm0 && lm0.length > 0 ? classifyGesture(lm0) : null;
-        const g1 = lm1 && lm1.length > 0 ? classifyGesture(lm1) : null;
+        const g0 = lm0 && lm0.length > 0 ? classifyGesture(lm0, 0) : null;
+        const g1 = lm1 && lm1.length > 0 ? classifyGesture(lm1, 1) : null;
 
         let combined: GestureId | null = null;
         if (lm0 && lm1 && lm0[0] && lm1[0]) {
